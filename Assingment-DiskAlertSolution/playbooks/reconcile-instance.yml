@@ -1,0 +1,188 @@
+---
+- name: Query SSM managed instance
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ssm
+      - describe-instance-information
+      - --region
+      - "{{ aws_region }}"
+      - --filters
+      - "Key=InstanceIds,Values={{ instance_id }}"
+      - --query
+      - "InstanceInformationList[0].[PlatformType,PingStatus]"
+      - --output
+      - json
+  register: ssm_info
+  changed_when: false
+
+- name: Validate SSM status
+  ansible.builtin.assert:
+    that:
+      - ssm_info.stdout | trim not in ['', 'null', '[]']
+      - (ssm_info.stdout | from_json)[1] == 'Online'
+    fail_msg: >-
+      Instance {{ instance_id }} is not online in SSM.
+      Check its SSM Agent, instance profile and network connectivity.
+
+- name: Set target platform
+  ansible.builtin.set_fact:
+    instance_platform: "{{ (ssm_info.stdout | from_json)[0] }}"
+
+- name: Build Linux reconciliation script
+  ansible.builtin.set_fact:
+    remote_script: |
+      set -eu
+
+      AGENT_CTL="/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl"
+      CONFIG="/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+
+      if [ ! -x "$AGENT_CTL" ]; then
+        echo "Agent missing: installing from Shared Services S3"
+
+        if command -v dpkg >/dev/null 2>&1; then
+          curl -fsSL "{{ linux_deb_url }}" -o /tmp/cw-agent.deb
+          dpkg -i /tmp/cw-agent.deb
+        elif command -v rpm >/dev/null 2>&1; then
+          curl -fsSL "{{ linux_rpm_url }}" -o /tmp/cw-agent.rpm
+          if command -v dnf >/dev/null 2>&1; then
+            dnf install -y /tmp/cw-agent.rpm
+          else
+            yum localinstall -y /tmp/cw-agent.rpm
+          fi
+        else
+          echo "Unsupported Linux package manager"
+          exit 2
+        fi
+      else
+        echo "Agent already installed: skipping installation"
+      fi
+
+      test -x "$AGENT_CTL"
+
+      curl -fsSL "{{ linux_config_url }}" -o /tmp/cw-agent-config.json
+      install -D -m 0644 /tmp/cw-agent-config.json "$CONFIG"
+
+      # Apply the latest configuration and start/restart the agent.
+      "$AGENT_CTL" -a fetch-config -m ec2 -c "file:$CONFIG" -s
+
+      systemctl enable amazon-cloudwatch-agent
+      systemctl start amazon-cloudwatch-agent
+      systemctl is-active --quiet amazon-cloudwatch-agent
+
+      echo "SUCCESS: Linux agent installed/verified and running"
+  when: instance_platform == 'Linux'
+
+- name: Build Windows reconciliation script
+  ansible.builtin.set_fact:
+    remote_script: |
+      $ErrorActionPreference = 'Stop'
+
+      $AgentCtl = 'C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1'
+      $Config = 'C:\ProgramData\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent.json'
+
+      if (-not (Test-Path $AgentCtl)) {
+        Write-Output 'Agent missing: installing from Shared Services S3'
+
+        $Msi = Join-Path $env:TEMP 'cw-agent.msi'
+        Invoke-WebRequest -Uri '{{ windows_msi_url }}' -OutFile $Msi
+
+        $Install = Start-Process msiexec.exe `
+          -ArgumentList @('/i', $Msi, '/qn', '/norestart') `
+          -Wait -PassThru
+
+        if ($Install.ExitCode -notin @(0, 3010)) {
+          throw "MSI installation failed with exit code $($Install.ExitCode)"
+        }
+      }
+      else {
+        Write-Output 'Agent already installed: skipping installation'
+      }
+
+      if (-not (Test-Path $AgentCtl)) {
+        throw 'CloudWatch Agent control script not found after installation'
+      }
+
+      New-Item -ItemType Directory -Path (Split-Path $Config) -Force | Out-Null
+      Invoke-WebRequest -Uri '{{ windows_config_url }}' -OutFile $Config
+
+      & $AgentCtl -a fetch-config -m ec2 -c "file:$Config" -s
+
+      Set-Service -Name AmazonCloudWatchAgent -StartupType Automatic
+      Start-Service -Name AmazonCloudWatchAgent
+
+      if ((Get-Service -Name AmazonCloudWatchAgent).Status -ne 'Running') {
+        throw 'CloudWatch Agent service is not running'
+      }
+
+      Write-Output 'SUCCESS: Windows agent installed/verified and running'
+  when: instance_platform == 'Windows'
+
+- name: Reject unsupported platforms
+  ansible.builtin.assert:
+    that:
+      - instance_platform in ['Linux', 'Windows']
+    fail_msg: "Unsupported platform {{ instance_platform }} on {{ instance_id }}."
+
+- name: Execute reconciliation through SSM
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ssm
+      - send-command
+      - --region
+      - "{{ aws_region }}"
+      - --instance-ids
+      - "{{ instance_id }}"
+      - --document-name
+      - "{{ 'AWS-RunPowerShellScript' if instance_platform == 'Windows' else 'AWS-RunShellScript' }}"
+      - --parameters
+      - "{{ {'commands': [remote_script]} | to_json }}"
+      - --timeout-seconds
+      - "{{ ssm_timeout_seconds | string }}"
+      - --query
+      - Command.CommandId
+      - --output
+      - text
+  register: remote_command
+  changed_when: true
+  no_log: true
+
+- name: Wait for SSM execution
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ssm
+      - get-command-invocation
+      - --region
+      - "{{ aws_region }}"
+      - --command-id
+      - "{{ remote_command.stdout | trim }}"
+      - --instance-id
+      - "{{ instance_id }}"
+      - --query
+      - Status
+      - --output
+      - text
+  register: remote_status
+  changed_when: false
+  failed_when: false
+  until: >-
+    remote_status.stdout | trim in
+    ['Success', 'Failed', 'Cancelled', 'TimedOut', 'Cancelling']
+  retries: "{{ poll_retries }}"
+  delay: "{{ poll_delay_seconds }}"
+
+- name: Confirm reconciliation succeeded
+  ansible.builtin.assert:
+    that:
+      - remote_status.stdout | trim == 'Success'
+    fail_msg: >-
+      Agent reconciliation failed for {{ instance_id }}.
+      SSM status: {{ remote_status.stdout | trim }}.
+
+- name: Report successful instance
+  ansible.builtin.debug:
+    msg: >-
+      {{ instance_id }}: CloudWatch Agent is installed, configured
+      and running.

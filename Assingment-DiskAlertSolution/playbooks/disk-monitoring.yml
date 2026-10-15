@@ -1,0 +1,85 @@
+---
+- name: Discover and reconcile CloudWatch Agent
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: ap-south-1
+    s3_region: ap-south-1
+
+    # Only running EC2 instances with this tag are selected.
+    target_tag_key: DiskMonitoring
+    target_tag_value: Enabled
+
+    config_bucket: company-shared-monitoring-artifacts
+
+    linux_rpm_key: cloudwatch-agent/linux/amazon-cloudwatch-agent.rpm
+    linux_deb_key: cloudwatch-agent/linux/amazon-cloudwatch-agent.deb
+    windows_msi_key: cloudwatch-agent/windows/amazon-cloudwatch-agent.msi
+
+    linux_config_key: config/linux-cloudwatch-agent.json
+    windows_config_key: config/windows-cloudwatch-agent.json
+
+    presigned_url_expiry: 900
+    ssm_timeout_seconds: 600
+    poll_retries: 36
+    poll_delay_seconds: 10
+
+  tasks:
+    - name: Verify AWS identity
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+      changed_when: false
+
+    - name: Discover tagged running EC2 instances
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-instances
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=instance-state-name,Values=running"
+          - "Name=tag:{{ target_tag_key }},Values={{ target_tag_value }}"
+          - --query
+          - "Reservations[].Instances[].InstanceId"
+          - --output
+          - json
+      register: discovered_instances
+      changed_when: false
+
+    - name: Convert discovery output into instance list
+      ansible.builtin.set_fact:
+        target_instance_ids: "{{ discovered_instances.stdout | from_json }}"
+
+    - name: Report discovery results
+      ansible.builtin.debug:
+        msg: >-
+          Discovered {{ target_instance_ids | length }} running instances
+          tagged {{ target_tag_key }}={{ target_tag_value }} in {{ aws_region }}.
+
+    - name: Generate temporary URLs for centrally managed artifacts
+      ansible.builtin.set_fact:
+        linux_rpm_url: >-
+          {{ lookup('pipe', 'aws s3 presign s3://' ~ config_bucket ~ '/' ~ linux_rpm_key ~ ' --expires-in ' ~ (presigned_url_expiry | string) ~ ' --region ' ~ s3_region) }}
+        linux_deb_url: >-
+          {{ lookup('pipe', 'aws s3 presign s3://' ~ config_bucket ~ '/' ~ linux_deb_key ~ ' --expires-in ' ~ (presigned_url_expiry | string) ~ ' --region ' ~ s3_region) }}
+        windows_msi_url: >-
+          {{ lookup('pipe', 'aws s3 presign s3://' ~ config_bucket ~ '/' ~ windows_msi_key ~ ' --expires-in ' ~ (presigned_url_expiry | string) ~ ' --region ' ~ s3_region) }}
+        linux_config_url: >-
+          {{ lookup('pipe', 'aws s3 presign s3://' ~ config_bucket ~ '/' ~ linux_config_key ~ ' --expires-in ' ~ (presigned_url_expiry | string) ~ ' --region ' ~ s3_region) }}
+        windows_config_url: >-
+          {{ lookup('pipe', 'aws s3 presign s3://' ~ config_bucket ~ '/' ~ windows_config_key ~ ' --expires-in ' ~ (presigned_url_expiry | string) ~ ' --region ' ~ s3_region) }}
+      no_log: true
+      when: target_instance_ids | length > 0
+
+    - name: Reconcile each discovered instance
+      ansible.builtin.include_tasks: reconcile-instance.yml
+      loop: "{{ target_instance_ids }}"
+      loop_control:
+        loop_var: instance_id
